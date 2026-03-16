@@ -27,7 +27,7 @@ except ImportError:
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("YUPOO_BOT_TOKEN", "8562968989:AAFayidjXx9QRRuYraIITZdtj0RLkeEMrVQ")
+BOT_TOKEN = os.getenv("YUPOO_BOT_TOKEN", "")
 TG_LIMIT  = 50 * 1024 * 1024
 
 
