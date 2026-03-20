@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Yupoo Downloader Bot v3
+Yupoo Downloader Bot v4
 pip install python-telegram-bot requests beautifulsoup4
 """
 
@@ -27,7 +27,7 @@ except ImportError:
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("YUPOO_BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("YUPOO_BOT_TOKEN", "METTI_QUI_IL_TUO_TOKEN")
 TG_LIMIT  = 50 * 1024 * 1024
 
 
@@ -203,17 +203,25 @@ def download_bytes(session, url, mtype):
         return data
     except Exception: return None
 
+def make_filename(idx: int, url: str, mtype: str, seller: str, album_id: str) -> str:
+    """Genera nome file con seller + album_id invece del semplice numero."""
+    ext = get_ext(url, mtype)
+    return f"{seller}_{album_id}_{idx:03d}{ext}"
+
 
 # ═══════════════════════════════════════════════
 #  STATO UTENTI
 # ═══════════════════════════════════════════════
 sessions: dict[int, dict] = {}
+stop_events: dict[int, bool] = {}
+# Coda album: uid -> lista di url in attesa
+queues: dict[int, list] = {}
 
 def get_user(uid: int) -> dict:
     if uid not in sessions:
         sessions[uid] = {
             "url": None,
-            "history": [],        # lista di url scaricati
+            "history": [],
             "total_albums": 0,
             "total_files": 0,
             "total_mb": 0.0,
@@ -225,20 +233,34 @@ def get_user(uid: int) -> dict:
 # ═══════════════════════════════════════════════
 #  KEYBOARDS
 # ═══════════════════════════════════════════════
-def kb_mode():
+def kb_preview():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🖼 Album Telegram", callback_data="mode_album"),
+            InlineKeyboardButton("🗜 ZIP",            callback_data="mode_zip"),
+        ],
+        [
+            InlineKeyboardButton("📷 Solo foto",  callback_data="mode_photos"),
+            InlineKeyboardButton("🎬 Solo video", callback_data="mode_videos"),
+        ],
+        [InlineKeyboardButton("❌ Annulla", callback_data="cancel")],
+    ])
+
+def kb_stop():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🖼 Album Telegram", callback_data="mode_album"),
-        InlineKeyboardButton("🗜 ZIP",            callback_data="mode_zip"),
+        InlineKeyboardButton("⏹ Stop download", callback_data="stop_download"),
     ]])
 
-def kb_after_download():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬇️ Scarica un altro album",  callback_data="new_download")],
-        [
-            InlineKeyboardButton("📊 Le mie statistiche", callback_data="show_stats"),
-            InlineKeyboardButton("📋 Cronologia",         callback_data="show_history"),
-        ],
+def kb_after_download(has_queue: bool = False):
+    rows = []
+    if has_queue:
+        rows.append([InlineKeyboardButton("▶️ Prossimo in coda", callback_data="next_queue")])
+    rows.append([InlineKeyboardButton("⬇️ Scarica un altro album", callback_data="new_download")])
+    rows.append([
+        InlineKeyboardButton("📊 Statistiche", callback_data="show_stats"),
+        InlineKeyboardButton("📋 Cronologia",  callback_data="show_history"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 def kb_back():
     return InlineKeyboardMarkup([[
@@ -247,7 +269,7 @@ def kb_back():
 
 
 # ═══════════════════════════════════════════════
-#  HELPERS DI TESTO
+#  HELPERS
 # ═══════════════════════════════════════════════
 def fmt_mb(b: float) -> str:
     if b < 1: return f"{b*1024:.0f} KB"
@@ -256,6 +278,13 @@ def fmt_mb(b: float) -> str:
 def progress_bar(current: int, total: int, width: int = 12) -> str:
     filled = int(width * current / total) if total else 0
     return "█" * filled + "░" * (width - filled)
+
+def parse_album_info(url: str) -> tuple[str, str]:
+    """Ritorna (seller, album_id) dall'URL."""
+    seller   = urlparse(url).netloc.split(".")[0]
+    m        = re.search(r"/albums/(\d+)", url)
+    album_id = m.group(1) if m else "0"
+    return seller, album_id
 
 
 # ═══════════════════════════════════════════════
@@ -268,30 +297,33 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 *Ciao {name}!*\n\n"
         "Sono il tuo downloader per album Yupoo.\n"
-        "Mandami un link e ti scarico tutto — foto e video.\n\n"
+        "Manda un link (o più link in fila) e scarico tutto.\n\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "📌 *Comandi disponibili*\n"
-        "/start — questo messaggio\n"
-        "/help  — come funziono\n"
-        "/stats — le tue statistiche\n"
-        "/history — ultimi album scaricati\n"
+        "📌 *Comandi*\n"
+        "/start   — questo messaggio\n"
+        "/help    — come funziono\n"
+        "/stats   — statistiche\n"
+        "/history — ultimi album\n"
+        "/annulla — ferma il download\n"
         "━━━━━━━━━━━━━━━━━\n\n"
-        "👇 *Inizia mandando un link album Yupoo*",
+        "👇 *Manda un link album Yupoo*",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Come funziono*\n\n"
-        "1️⃣ Mandami il link di un album Yupoo\n"
-        "   es: `https://seller.x.yupoo.com/albums/123456`\n\n"
-        "2️⃣ Scegli la modalità di invio:\n"
-        "   🖼 *Album Telegram* — foto in anteprima, a gruppi di 10, le vedi subito nella chat\n"
-        "   🗜 *ZIP* — tutto compresso in un file, comodo per salvare o condividere\n\n"
-        "3️⃣ Aspetta che finisco e ricevi tutto!\n\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "⚠️ *Limiti Telegram*: max 50 MB per file\n"
-        "Se lo ZIP è più grande lo spezzerò in parti automaticamente.",
+        "1️⃣ Manda uno o più link Yupoo (anche più messaggi di fila)\n"
+        "2️⃣ Vedi l'anteprima con numero foto/video\n"
+        "3️⃣ Scegli la modalità:\n"
+        "   🖼 *Album Telegram* — foto in anteprima a gruppi\n"
+        "   🗜 *ZIP* — file compresso unico\n"
+        "   📷 *Solo foto* — ignora i video\n"
+        "   🎬 *Solo video* — ignora le foto\n\n"
+        "📁 I file si chiamano `seller_albumid_001.jpg`\n"
+        "⏹ Puoi stoppare in qualsiasi momento\n"
+        "🔢 Più link = coda automatica\n\n"
+        "⚠️ Limite Telegram: 50 MB per file",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -299,29 +331,35 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     data = get_user(uid)
     mins = int((datetime.now() - data["started"]).total_seconds() / 60)
-    await update.message.reply_text(
+    q    = queues.get(uid, [])
+    txt  = (
         "📊 *Le tue statistiche*\n\n"
         f"📦 Album scaricati:  `{data['total_albums']}`\n"
         f"🖼 File ricevuti:    `{data['total_files']}`\n"
         f"💾 Dati scaricati:  `{fmt_mb(data['total_mb'])}`\n"
-        f"⏱ Sessione attiva: `{mins} min`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_back(),
+        f"⏱ Sessione attiva: `{mins} min`"
     )
+    if q:
+        txt += f"\n📋 In coda: `{len(q)}` album"
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back())
 
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid     = update.effective_user.id
-    data    = get_user(uid)
-    history = data.get("history", [])
+    history = get_user(uid).get("history", [])
     if not history:
-        await update.message.reply_text("📋 Non hai ancora scaricato nessun album.", reply_markup=kb_back())
+        await update.message.reply_text("📋 Nessun album scaricato ancora.", reply_markup=kb_back())
         return
     lines = "\n".join(f"`{i+1}.` {url}" for i, url in enumerate(history[-10:]))
     await update.message.reply_text(
-        f"📋 *Ultimi album scaricati*\n\n{lines}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_back(),
+        f"📋 *Ultimi album*\n\n{lines}",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back(),
     )
+
+async def cmd_annulla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    stop_events[uid] = True
+    queues[uid] = []
+    await update.message.reply_text("⏹ Download interrotto e coda svuotata.")
 
 
 # ═══════════════════════════════════════════════
@@ -333,32 +371,82 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if "yupoo.com" not in text or "/albums/" not in text:
         await update.message.reply_text(
-            "❌ Link non valido.\n\n"
-            "Deve essere tipo:\n"
-            "`https://seller.x.yupoo.com/albums/123456789`",
+            "❌ Link non valido.\n`https://seller.x.yupoo.com/albums/123456789`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    seller, album_id = parse_album_info(text)
+
+    # Se c'è già un download in corso, aggiungi alla coda
+    if get_user(uid).get("downloading"):
+        q = queues.setdefault(uid, [])
+        if text not in q:
+            q.append(text)
+        await update.message.reply_text(
+            f"📋 Aggiunto in coda — posizione `{len(q)}`\n"
+            f"🏪 `{seller}` — album `#{album_id}`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     get_user(uid)["url"] = text
+    await _show_preview(update.message, text, seller, album_id)
 
-    # Estrai titolo/ID album per mostrarlo
-    aid = re.search(r"/albums/(\d+)", text)
-    aid_str = f"#{aid.group(1)}" if aid else ""
-    seller  = urlparse(text).netloc.split(".")[0]
 
-    await update.message.reply_text(
-        f"🔗 *Album ricevuto!*\n\n"
-        f"🏪 Seller: `{seller}`\n"
-        f"📁 Album: `{aid_str}`\n\n"
-        f"Come vuoi ricevere i file?",
+async def _show_preview(message, url: str, seller: str, album_id: str):
+    """Analizza l'album e mostra anteprima con conteggio foto/video."""
+    msg = await message.reply_text(
+        f"🔍 Analizzo `{seller}` — album `#{album_id}`...",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_mode(),
     )
+    try:
+        session = get_session()
+        html    = fetch_url(session, url).text
+        api_key = extract_api_key(html)
+        n_img = n_vid = n_total = 0
+        title = ""
+
+        if api_key:
+            m = re.search(r"/albums/(\d+)", url)
+            if m:
+                d = yupoo_api(session, "yupoo.albums.getPhotos",
+                              {"api_key": api_key, "album_id": m.group(1), "page": 1, "per_page": 1})
+                if d.get("stat") == "ok":
+                    n_total = int(d.get("photos", {}).get("total", 0))
+                    soup    = BeautifulSoup(html, "html.parser")
+                    n_vid   = len(soup.find_all(attrs={"data-type": "video"}))
+                    n_img   = max(0, n_total - n_vid)
+                    t = soup.find("title")
+                    if t: title = t.text.split("|")[0].strip()[:55]
+
+        if n_total == 0:
+            soup    = BeautifulSoup(html, "html.parser")
+            n_img   = len(soup.find_all("img", attrs={"data-origin-src": True}))
+            n_vid   = len(soup.find_all(attrs={"data-type": "video"}))
+            n_total = n_img + n_vid
+            t = soup.find("title")
+            if t: title = t.text.split("|")[0].strip()[:55]
+
+        preview = f"📋 *Anteprima album*\n\n🏪 `{seller}` — `#{album_id}`\n"
+        if title: preview += f"📝 _{title}_\n"
+        preview += (
+            f"\n🖼 Foto:   `{n_img}`\n"
+            f"🎬 Video:  `{n_vid}`\n"
+            f"📦 Totale: `{n_total}`\n\n"
+            f"Come vuoi scaricare?"
+        )
+        await msg.edit_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_preview())
+
+    except Exception:
+        await msg.edit_text(
+            f"🔗 *Album pronto*\n🏪 `{seller}` — `#{album_id}`\n\nCome vuoi scaricare?",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_preview(),
+        )
 
 
 # ═══════════════════════════════════════════════
-#  CALLBACK HANDLER (bottoni inline)
+#  CALLBACK HANDLER
 # ═══════════════════════════════════════════════
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -366,10 +454,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = query.from_user.id
     data = query.data
 
-    # ── Menu post-download ──
+    if data == "cancel":
+        await query.edit_message_text("❌ Annullato.")
+        return
+
     if data == "new_download":
         await query.edit_message_text(
-            "👇 *Mandami il link del prossimo album Yupoo*",
+            "👇 *Manda il link del prossimo album Yupoo*\n"
+            "_Puoi mandare più link di fila per metterli in coda._",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -378,33 +470,60 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s    = get_user(uid)
         mins = int((datetime.now() - s["started"]).total_seconds() / 60)
         await query.edit_message_text(
-            "📊 *Le tue statistiche*\n\n"
-            f"📦 Album scaricati:  `{s['total_albums']}`\n"
-            f"🖼 File ricevuti:    `{s['total_files']}`\n"
-            f"💾 Dati scaricati:  `{fmt_mb(s['total_mb'])}`\n"
-            f"⏱ Sessione attiva: `{mins} min`",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_back(),
+            "📊 *Statistiche*\n\n"
+            f"📦 Album: `{s['total_albums']}`\n"
+            f"🖼 File:  `{s['total_files']}`\n"
+            f"💾 Dati: `{fmt_mb(s['total_mb'])}`\n"
+            f"⏱ Sessione: `{mins} min`",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back(),
         )
         return
 
     if data == "show_history":
-        s       = get_user(uid)
-        history = s.get("history", [])
+        history = get_user(uid).get("history", [])
         if not history:
-            await query.edit_message_text("📋 Nessun album scaricato ancora.", reply_markup=kb_back())
+            await query.edit_message_text("📋 Nessun album ancora.", reply_markup=kb_back())
             return
-        lines = "\n".join(f"`{i+1}.` {url}" for i, url in enumerate(history[-10:]))
+        lines = "\n".join(f"`{i+1}.` {u}" for i, u in enumerate(history[-10:]))
         await query.edit_message_text(
             f"📋 *Ultimi album*\n\n{lines}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_back(),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back(),
         )
         return
 
-    # ── Modalità download ──
-    if data not in ("mode_album", "mode_zip"):
+    if data == "stop_download":
+        stop_events[uid] = True
+        try:
+            await query.edit_message_text(
+                "⏹ *Stop richiesto* — fermo dopo il file corrente...",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception: pass
         return
+
+    if data == "next_queue":
+        q = queues.get(uid, [])
+        if not q:
+            await query.edit_message_text("📋 Coda vuota.")
+            return
+        next_url = q.pop(0)
+        get_user(uid)["url"] = next_url
+        seller, album_id = parse_album_info(next_url)
+        await query.edit_message_text(f"▶️ Prossimo album: `{seller}` `#{album_id}`...", parse_mode=ParseMode.MARKDOWN)
+        await _show_preview(query.message, next_url, seller, album_id)
+        return
+
+    # ── Modalità download ──
+    mode_map = {
+        "mode_album":  ("all",    False),
+        "mode_zip":    ("all",    True),
+        "mode_photos": ("photos", False),
+        "mode_videos": ("videos", False),
+    }
+    if data not in mode_map:
+        return
+
+    filter_type, mode_zip = mode_map[data]
 
     s = get_user(uid)
     album_url = s.get("url")
@@ -412,108 +531,122 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Sessione scaduta, manda di nuovo il link.")
         return
 
-    mode_zip = (data == "mode_zip")
-    mode_str = "ZIP 🗜" if mode_zip else "Album Telegram 🖼"
-
+    seller, album_id = parse_album_info(album_url)
+    mode_labels = {
+        "mode_album":  "Album Telegram 🖼",
+        "mode_zip":    "ZIP 🗜",
+        "mode_photos": "Solo foto 📷",
+        "mode_videos": "Solo video 🎬",
+    }
     await query.edit_message_text(
-        f"⏳ Avvio download in modalità *{mode_str}*...",
+        f"⏳ *{mode_labels[data]}*\n`{seller}` — `#{album_id}`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    status = await query.message.reply_text("🔍 Analisi album in corso...")
+    status = await query.message.reply_text("🔍 Raccolta media in corso...")
+    s["downloading"] = True
+    stop_events[uid] = False
 
-    # Raccolta media
     try:
         media = collect_media(album_url)
     except Exception as e:
-        await status.edit_text(f"❌ Errore analisi: {e}")
+        s["downloading"] = False
+        await status.edit_text(f"❌ Errore: {e}")
         return
 
     if not media:
+        s["downloading"] = False
         await status.edit_text(
-            "❌ *Nessun media trovato*\n\n"
-            "Possibili cause:\n"
-            "• Album privato o rimosso\n"
-            "• Link non valido\n"
-            "• Yupoo temporaneamente non raggiungibile",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_back(),
+            "❌ *Nessun media trovato*\n\n• Album privato?\n• Link non valido?",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back(),
         )
+        return
+
+    # Applica filtro tipo
+    if filter_type == "photos":
+        media = [x for x in media if x["type"] == "image"]
+    elif filter_type == "videos":
+        media = [x for x in media if x["type"] == "video"]
+
+    if not media:
+        s["downloading"] = False
+        await status.edit_text("❌ Nessun file del tipo selezionato trovato.")
         return
 
     n_img = sum(1 for x in media if x["type"] == "image")
     n_vid = sum(1 for x in media if x["type"] == "video")
-    await status.edit_text(
-        f"📦 *{n_img}* immagini + *{n_vid}* video trovati\n"
-        f"⬇️ Download in corso...\n\n"
-        f"`{progress_bar(0, len(media))}` 0%",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await status.edit_text(
+            f"📦 *{n_img}* foto + *{n_vid}* video\n"
+            f"⬇️ Download in corso...\n\n"
+            f"`{progress_bar(0, len(media))}` 0%",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_stop(),
+        )
+    except Exception: pass
 
-    session     = get_session()
-    ok          = 0
-    total_bytes = 0
+    session = get_session()
+    ok = 0; total_bytes = 0
 
     if mode_zip:
-        ok, total_bytes = await _send_zip(query.message, session, media, album_url, status)
+        ok, total_bytes = await _send_zip(query.message, session, media, album_url, seller, album_id, status, uid)
     else:
-        ok, total_bytes = await _send_album(query.message, session, media, status)
+        ok, total_bytes = await _send_album(query.message, session, media, seller, album_id, status, uid)
 
-    # Aggiorna statistiche utente
+    s["downloading"] = False
     s["total_albums"] += 1
     s["total_files"]  += ok
     s["total_mb"]     += total_bytes / 1024 / 1024
     if album_url not in s["history"]:
         s["history"].append(album_url)
 
-    # Messaggio finale — cancella il messaggio di stato (sepolto tra le foto)
-    # e manda un messaggio NUOVO in fondo alla chat, sempre visibile
-    now     = datetime.now().strftime("%d.%m.%Y %H:%M")
-    skipped = len(media) - ok
+    was_stopped = stop_events.get(uid, False)
+    now         = datetime.now().strftime("%d.%m.%Y %H:%M")
+    skipped     = len(media) - ok
+    q_remaining = queues.get(uid, [])
+
     summary = (
-        f"✅ *Download completato!*\n"
+        f"{'⏹' if was_stopped else '✅'} *{'Interrotto' if was_stopped else 'Completato'}!*\n"
         f"📅 `{now}`\n\n"
+        f"🏪 `{seller}` — `#{album_id}`\n"
         f"🖼 File inviati:  `{ok}/{len(media)}`\n"
         f"💾 Dimensione:   `{fmt_mb(total_bytes/1024/1024)}`\n"
-        f"📦 Totale album: `{s['total_albums']}`"
+        f"📦 Album totali: `{s['total_albums']}`"
     )
     if skipped:
-        summary += f"\n⚠️ Saltati: `{skipped}` (protetti o >50 MB)"
-
+        summary += f"\n⚠️ Saltati: `{skipped}`"
+    if q_remaining:
+        summary += f"\n\n📋 In coda: `{len(q_remaining)}` album"
     summary += "\n\n*Cosa vuoi fare adesso?*"
 
-    # Elimina il vecchio messaggio di progresso (era rimasto in mezzo alle foto)
-    try:
-        await status.delete()
-    except Exception:
-        pass
+    try: await status.delete()
+    except Exception: pass
 
-    # Manda il riepilogo come messaggio nuovo → appare SEMPRE in fondo
     await query.message.reply_text(
         summary,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_after_download(),
+        reply_markup=kb_after_download(has_queue=bool(q_remaining)),
+        disable_notification=True,  # notifica silenziosa
     )
 
 
 # ═══════════════════════════════════════════════
-#  INVIO ALBUM (media group, 10 per volta)
+#  INVIO ALBUM
 # ═══════════════════════════════════════════════
-async def _send_album(message, session, media: list[dict], status_msg) -> tuple[int, int]:
-    ok = 0; total_bytes = 0
-    batch = []
+async def _send_album(message, session, media, seller, album_id, status_msg, uid=0):
+    ok = 0; total_bytes = 0; batch = []
 
-    async def flush(b: list):
+    async def flush(b):
         nonlocal ok, total_bytes
         tg_media = []
         for i, (data, mtype, fname) in enumerate(b):
             buf = io.BytesIO(data); buf.name = fname
-            caption = f"`{fname}`" if i == 0 else None
+            cap = f"`{fname}`" if i == 0 else None
             if mtype == "video":
-                tg_media.append(InputMediaVideo(media=buf, filename=fname, caption=caption,
+                tg_media.append(InputMediaVideo(media=buf, filename=fname, caption=cap,
                                                 parse_mode=ParseMode.MARKDOWN, supports_streaming=True))
             else:
-                tg_media.append(InputMediaPhoto(media=buf, caption=caption, parse_mode=ParseMode.MARKDOWN))
+                tg_media.append(InputMediaPhoto(media=buf, caption=cap, parse_mode=ParseMode.MARKDOWN))
             ok += 1; total_bytes += len(data)
         try:
             await message.reply_media_group(media=tg_media)
@@ -526,51 +659,49 @@ async def _send_album(message, session, media: list[dict], status_msg) -> tuple[
                 except Exception: pass
 
     for idx, item in enumerate(media, 1):
+        if stop_events.get(uid): break
         url, mtype = item["url"], item["type"]
-        fname = f"{idx:04d}{get_ext(url, mtype)}"
-
-        pct = int(idx / len(media) * 100)
+        fname = make_filename(idx, url, mtype, seller, album_id)
+        pct   = int(idx / len(media) * 100)
         try:
             await status_msg.edit_text(
                 f"⬇️ *{idx}/{len(media)}* — `{fname}`\n\n"
-                f"`{progress_bar(idx, len(media))}` {pct}%",
+                f"`{progress_bar(idx, len(media))}` {pct}%\n"
+                f"_Premi Stop per interrompere_",
                 parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_stop(),
             )
         except Exception: pass
-
         data = download_bytes(session, url, mtype)
-        if not data or len(data) > TG_LIMIT:
-            continue
-
+        if not data or len(data) > TG_LIMIT: continue
         batch.append((data, mtype, fname))
         if len(batch) == 10:
-            await flush(batch); batch = []; await asyncio.sleep(0.5) if False else time.sleep(0.3)
+            await flush(batch); batch = []; time.sleep(0.3)
 
-    if batch:
-        await flush(batch)
-
+    if batch: await flush(batch)
     return ok, total_bytes
 
 
 # ═══════════════════════════════════════════════
 #  INVIO ZIP
 # ═══════════════════════════════════════════════
-async def _send_zip(message, session, media: list[dict], album_url: str, status_msg) -> tuple[int, int]:
-    aid      = re.search(r"/albums/(\d+)", album_url)
-    zip_name = f"album_{aid.group(1)}.zip" if aid else "album.zip"
-    buf      = io.BytesIO()
-    ok       = 0; total_bytes = 0
+async def _send_zip(message, session, media, album_url, seller, album_id, status_msg, uid=0):
+    zip_name = f"{seller}_{album_id}.zip"
+    buf = io.BytesIO(); ok = 0; total_bytes = 0
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
         for idx, item in enumerate(media, 1):
+            if stop_events.get(uid): break
             url, mtype = item["url"], item["type"]
-            fname = f"{idx:04d}{get_ext(url, mtype)}"
+            fname = make_filename(idx, url, mtype, seller, album_id)
             pct   = int(idx / len(media) * 100)
             try:
                 await status_msg.edit_text(
                     f"⬇️ *{idx}/{len(media)}* — `{fname}`\n\n"
-                    f"`{progress_bar(idx, len(media))}` {pct}%",
+                    f"`{progress_bar(idx, len(media))}` {pct}%\n"
+                    f"_Premi Stop per interrompere_",
                     parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb_stop(),
                 )
             except Exception: pass
             data = download_bytes(session, url, mtype)
@@ -579,38 +710,38 @@ async def _send_zip(message, session, media: list[dict], album_url: str, status_
             time.sleep(0.15)
 
     buf.seek(0); zip_bytes = buf.getvalue()
-    await status_msg.edit_text(
-        f"📤 Invio `{zip_name}` ({len(zip_bytes)//1024} KB)...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await status_msg.edit_text(
+            f"📤 Invio `{zip_name}` ({len(zip_bytes)//1024} KB)...",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception: pass
 
     if len(zip_bytes) <= TG_LIMIT:
         b = io.BytesIO(zip_bytes); b.name = zip_name
-        await message.reply_document(document=b, filename=zip_name,
-                                     caption=f"📦 {ok} file")
+        await message.reply_document(document=b, filename=zip_name, caption=f"📦 {ok} file")
     else:
-        parts = _split_zip(media, session, zip_name)
+        parts = _split_zip(media, session, seller, album_id)
         for i, (pname, pbuf) in enumerate(parts, 1):
             pbuf.seek(0)
-            await message.reply_document(document=pbuf, filename=pname,
-                                         caption=f"📦 Parte {i}/{len(parts)}")
+            await message.reply_document(document=pbuf, filename=pname, caption=f"Parte {i}/{len(parts)}")
 
     return ok, total_bytes
 
-def _split_zip(media, session, base_name):
+def _split_zip(media, session, seller, album_id):
     MAX = 45 * 1024 * 1024
     parts, part, buf, cur = [], 1, io.BytesIO(), 0
     zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
     for idx, item in enumerate(media, 1):
         data = download_bytes(session, item["url"], item["type"])
         if not data: continue
-        fname = f"{idx:04d}{get_ext(item['url'], item['type'])}"
+        fname = make_filename(idx, item["url"], item["type"], seller, album_id)
         if cur + len(data) > MAX and cur > 0:
-            zf.close(); parts.append((f"{base_name}.part{part}.zip", buf))
+            zf.close(); parts.append((f"{seller}_{album_id}_part{part}.zip", buf))
             part += 1; buf = io.BytesIO(); zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED); cur = 0
         zf.writestr(fname, data); cur += len(data)
     zf.close()
-    if cur > 0: parts.append((f"{base_name}.part{part}.zip", buf))
+    if cur > 0: parts.append((f"{seller}_{album_id}_part{part}.zip", buf))
     return parts
 
 
@@ -620,13 +751,13 @@ def _split_zip(media, session, base_name):
 def main():
     if BOT_TOKEN == "METTI_QUI_IL_TUO_TOKEN":
         print("ERRORE: configura YUPOO_BOT_TOKEN"); sys.exit(1)
-
-    print("🤖 Yupoo Bot v3 avviato — pronto!")
+    print("🤖 Yupoo Bot v4 avviato!")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("stats",   cmd_stats))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("annulla", cmd_annulla))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
