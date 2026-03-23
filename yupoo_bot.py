@@ -203,6 +203,97 @@ def download_bytes(session, url, mtype):
         return data
     except Exception: return None
 
+def fetch_category_covers(session, cat_url: str) -> list[dict]:
+    """
+    Scarica la lista album da una pagina categoria Yupoo
+    e ritorna la copertina (prima foto) di ogni album.
+    Ritorna lista di dict: {"url": str, "title": str, "album_id": str}
+    """
+    parsed   = urlparse(cat_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    html     = fetch_url(session, cat_url).text
+    api_key  = extract_api_key(html)
+    m        = re.search(r"/categories/(\d+)", cat_url)
+    cat_id   = m.group(1) if m else ""
+
+    covers = []
+
+    # Strategia 1: API REST
+    if api_key and cat_id:
+        page = 1
+        while True:
+            data = yupoo_api(session, "yupoo.albums.getList", {
+                "api_key":  api_key,
+                "cat_id":   cat_id,
+                "page":     page,
+                "per_page": 100,
+            })
+            if data.get("stat") != "ok":
+                break
+            aobj   = data.get("albums", {})
+            alist  = aobj.get("album", [])
+            npages = int(aobj.get("pages", 1))
+
+            for album in alist:
+                album_id = str(album.get("id") or album.get("album_id") or "")
+                title    = album.get("title") or album.get("name") or album_id
+
+                # Prendi la prima foto dell'album
+                cover_url = ""
+                # Campo cover diretto
+                cover = album.get("cover") or album.get("coverPhoto") or {}
+                if isinstance(cover, dict):
+                    cover_url = build_photo_url(cover)
+                # Oppure vai a prendere la prima foto
+                if not cover_url and album_id and api_key:
+                    try:
+                        pd = yupoo_api(session, "yupoo.albums.getPhotos", {
+                            "api_key": api_key, "album_id": album_id,
+                            "page": 1, "per_page": 1,
+                        })
+                        if pd.get("stat") == "ok":
+                            photos = pd.get("photos", {}).get("photo", [])
+                            if photos:
+                                cover_url = build_photo_url(photos[0])
+                    except Exception:
+                        pass
+
+                if cover_url:
+                    covers.append({"url": cover_url, "title": title, "album_id": album_id})
+                time.sleep(0.05)
+
+            if page >= npages:
+                break
+            page += 1
+            time.sleep(0.3)
+
+    # Strategia 2: HTML fallback — cerca thumbnail degli album nella pagina
+    if not covers:
+        soup = BeautifulSoup(html, "html.parser")
+        for a_tag in soup.find_all("a", href=re.compile(r"/albums/\d+")):
+            href = a_tag.get("href", "")
+            m2   = re.search(r"/albums/(\d+)", href)
+            if not m2:
+                continue
+            album_id = m2.group(1)
+            # Cerca immagine di copertina dentro il tag
+            img = a_tag.find("img")
+            if not img:
+                continue
+            url = img.get("data-origin-src") or img.get("data-src") or img.get("src") or ""
+            if not url or "undefined" in url:
+                continue
+            if not url.startswith("http"):
+                url = urljoin(base_url, url)
+            url   = url.split("?")[0]
+            title = a_tag.get("title") or img.get("alt") or album_id
+            # Evita duplicati
+            if not any(c["album_id"] == album_id for c in covers):
+                covers.append({"url": url, "title": title, "album_id": album_id})
+
+    return covers
+
+
 def make_filename(idx: int, url: str, mtype: str, seller: str, album_id: str) -> str:
     """Genera nome file con seller + album_id invece del semplice numero."""
     ext = get_ext(url, mtype)
@@ -369,11 +460,24 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     uid  = update.effective_user.id
 
-    if "yupoo.com" not in text or "/albums/" not in text:
+    is_album    = "yupoo.com" in text and "/albums/" in text
+    is_category = "yupoo.com" in text and "/categories/" in text
+
+    if not is_album and not is_category:
         await update.message.reply_text(
-            "❌ Link non valido.\n`https://seller.x.yupoo.com/albums/123456789`",
+            "❌ Link non valido.\n\n"
+            "Album: `https://seller.x.yupoo.com/albums/123456789`\n"
+            "Categoria: `https://seller.x.yupoo.com/categories/123456789`",
             parse_mode=ParseMode.MARKDOWN,
         )
+        return
+
+    # Categoria → scarica copertine
+    if is_category:
+        if get_user(uid).get("downloading"):
+            await update.message.reply_text("⏳ Download in corso, aspetta che finisca.")
+            return
+        await _handle_category(update.message, text, uid)
         return
 
     seller, album_id = parse_album_info(text)
@@ -392,6 +496,52 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     get_user(uid)["url"] = text
     await _show_preview(update.message, text, seller, album_id)
+
+
+async def _handle_category(message, cat_url: str, uid: int):
+    """Gestisce un link categoria: scarica la copertina di ogni album."""
+    parsed   = urlparse(cat_url)
+    seller   = parsed.netloc.split(".")[0]
+    m        = re.search(r"/categories/(\d+)", cat_url)
+    cat_id   = m.group(1) if m else "?"
+
+    msg = await message.reply_text(
+        f"🔍 Analizzo categoria `#{cat_id}` di `{seller}`...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    session = get_session()
+    try:
+        covers = fetch_category_covers(session, cat_url)
+    except Exception as e:
+        await msg.edit_text(f"❌ Errore: {e}")
+        return
+
+    if not covers:
+        await msg.edit_text(
+            "❌ Nessun album trovato in questa categoria.\n"
+            "La categoria potrebbe essere privata o vuota."
+        )
+        return
+
+    await msg.edit_text(
+        f"📂 *Categoria `#{cat_id}`* — `{seller}`\n\n"
+        f"📦 Album trovati: `{len(covers)}`\n"
+        f"🖼 Scarico una copertina per album...\n\n"
+        f"Come vuoi riceverle?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🖼 Album Telegram", callback_data=f"cat_album"),
+                InlineKeyboardButton("🗜 ZIP",            callback_data=f"cat_zip"),
+            ],
+            [InlineKeyboardButton("❌ Annulla", callback_data="cancel")],
+        ]),
+    )
+    # Salva i dati per il callback
+    get_user(uid)["cat_covers"] = covers
+    get_user(uid)["cat_seller"] = seller
+    get_user(uid)["cat_id"]     = cat_id
 
 
 async def _show_preview(message, url: str, seller: str, album_id: str):
@@ -453,6 +603,114 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     uid  = query.from_user.id
     data = query.data
+
+    if data in ("cat_album", "cat_zip"):
+        s       = get_user(uid)
+        covers  = s.get("cat_covers", [])
+        seller  = s.get("cat_seller", "seller")
+        cat_id  = s.get("cat_id", "0")
+        mode_zip = (data == "cat_zip")
+
+        if not covers:
+            await query.edit_message_text("❌ Dati categoria scaduti, manda di nuovo il link.")
+            return
+
+        await query.edit_message_text(
+            f"⬇️ Scarico `{len(covers)}` copertine...",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        status = await query.message.reply_text(
+            f"`{progress_bar(0, len(covers))}` 0%",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_stop(),
+        )
+
+        s["downloading"] = True
+        stop_events[uid] = False
+        session = get_session()
+        ok = 0; total_bytes = 0; batch = []
+
+        async def flush_batch(b):
+            nonlocal ok, total_bytes
+            tg_media = []
+            for i, (data_b, fname, title) in enumerate(b):
+                buf = io.BytesIO(data_b); buf.name = fname
+                cap = f"`{fname}`\n_{title}_" if i == 0 else None
+                tg_media.append(InputMediaPhoto(media=buf, caption=cap, parse_mode=ParseMode.MARKDOWN))
+                ok += 1; total_bytes += len(data_b)
+            try:
+                await query.message.reply_media_group(media=tg_media)
+            except Exception:
+                for data_b, fname, _ in b:
+                    buf = io.BytesIO(data_b); buf.name = fname
+                    try: await query.message.reply_document(document=buf, filename=fname)
+                    except Exception: pass
+
+        zip_buf = io.BytesIO()
+        zf      = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_STORED) if mode_zip else None
+
+        for idx, cover in enumerate(covers, 1):
+            if stop_events.get(uid): break
+            url   = cover["url"]
+            title = cover["title"][:40]
+            fname = f"{seller}_{cat_id}_cover{idx:03d}{get_ext(url)}"
+            pct   = int(idx / len(covers) * 100)
+            try:
+                await status.edit_text(
+                    f"⬇️ *{idx}/{len(covers)}* — `{fname}`\n\n"
+                    f"`{progress_bar(idx, len(covers))}` {pct}%",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb_stop(),
+                )
+            except Exception: pass
+
+            data_b = download_bytes(session, url, "image")
+            if not data_b:
+                continue
+
+            if mode_zip and zf:
+                zf.writestr(fname, data_b)
+                ok += 1; total_bytes += len(data_b)
+            else:
+                batch.append((data_b, fname, title))
+                if len(batch) == 10:
+                    await flush_batch(batch); batch = []; time.sleep(0.3)
+
+            time.sleep(0.15)
+
+        if not mode_zip and batch:
+            await flush_batch(batch)
+
+        if mode_zip and zf:
+            zf.close()
+            zip_buf.seek(0)
+            zip_name = f"{seller}_cat{cat_id}_covers.zip"
+            zb = zip_buf.getvalue()
+            try:
+                await status.edit_text(f"📤 Invio ZIP `{zip_name}` ({len(zb)//1024} KB)...", parse_mode=ParseMode.MARKDOWN)
+            except Exception: pass
+            b2 = io.BytesIO(zb); b2.name = zip_name
+            await query.message.reply_document(document=b2, filename=zip_name, caption=f"📂 {ok} copertine")
+
+        s["downloading"] = False
+        s["total_files"] += ok
+        s["total_mb"]    += total_bytes / 1024 / 1024
+
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        try: await status.delete()
+        except Exception: pass
+
+        await query.message.reply_text(
+            f"✅ *Copertine scaricate!*\n"
+            f"📅 `{now}`\n\n"
+            f"📂 Categoria: `#{cat_id}`\n"
+            f"🖼 Copertine: `{ok}/{len(covers)}`\n\n"
+            f"*Cosa vuoi fare adesso?*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_after_download(),
+            disable_notification=True,
+        )
+        return
 
     if data == "cancel":
         await query.edit_message_text("❌ Annullato.")
