@@ -213,7 +213,7 @@ def fetch_category_covers(session, cat_url: str) -> list[dict]:
     base_url = f"{parsed.scheme}://{parsed.netloc}"
     html     = fetch_url(session, cat_url).text
     api_key  = extract_api_key(html)
-    m        = re.search(r"/categories/(\d+)", cat_url)
+    m        = re.search(r"/(?:categories|collections)/(\d+)", cat_url)
     cat_id   = m.group(1) if m else ""
 
     covers = []
@@ -222,7 +222,8 @@ def fetch_category_covers(session, cat_url: str) -> list[dict]:
     if api_key and cat_id:
         page = 1
         while True:
-            data = yupoo_api(session, "yupoo.albums.getList", {
+            method = "yupoo.collections.getAlbums" if "/collections/" in cat_url else "yupoo.albums.getList"
+            data = yupoo_api(session, method, {
                 "api_key":  api_key,
                 "cat_id":   cat_id,
                 "page":     page,
@@ -461,7 +462,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
 
     is_album    = "yupoo.com" in text and "/albums/" in text
-    is_category = "yupoo.com" in text and "/categories/" in text
+    is_category = "yupoo.com" in text and ("/categories/" in text or "/collections/" in text)
 
     if not is_album and not is_category:
         await update.message.reply_text(
@@ -502,7 +503,7 @@ async def _handle_category(message, cat_url: str, uid: int):
     """Gestisce un link categoria: scarica la copertina di ogni album."""
     parsed   = urlparse(cat_url)
     seller   = parsed.netloc.split(".")[0]
-    m        = re.search(r"/categories/(\d+)", cat_url)
+    m        = re.search(r"/(?:categories|collections)/(\d+)", cat_url)
     cat_id   = m.group(1) if m else "?"
 
     msg = await message.reply_text(
